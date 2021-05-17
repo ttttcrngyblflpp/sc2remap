@@ -1,0 +1,16 @@
+[package]
+name = "sc2k"
+version = "0.1.0"
+authors = ["tone <tony.y.gong@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+"evdev-rs" = "0.5"
+"argh" = "0.1"
+"epoll" = "4.3"
+"nix" = "0.20"
+"log" = "0.4"
+"simplelog" = "0.10"
+"uinput-sys" = "0.1"
