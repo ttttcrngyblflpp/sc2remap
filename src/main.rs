@@ -1,19 +1,15 @@
+use anyhow::Context as _;
 use argh::FromArgs;
-use evdev_rs::enums::{EventCode, EventType, InputProp, EV_KEY, EV_REL, EV_SYN};
+use evdev_rs::enums::{EventCode, EventType, EV_KEY, EV_REL, EV_SYN};
 use evdev_rs::{DeviceWrapper as _, InputEvent};
-use log::{debug, info};
+use log::{debug, info, trace};
+use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::io::{AsRawFd as _, RawFd};
 
 #[derive(FromArgs)]
 /// SC2 input remapping arguments.
 struct Args {
-    /// keyboard device ID
-    #[argh(option, short = 'k')]
-    keyboard_device_id: usize,
-    /// mouse device ID
-    #[argh(option, short = 'm')]
-    mouse_device_id: usize,
     /// log level
     #[argh(option, short = 'l', default = "simplelog::LevelFilter::Info")]
     log_level: simplelog::LevelFilter,
@@ -37,7 +33,6 @@ struct State {
     current_key: Option<EV_KEY>,
     next_key: EV_KEY,
     held: bool,
-    middle: bool,
 }
 
 fn process_event<F: FnMut(InputEvent)>(device: &evdev_rs::Device, mut f: F) {
@@ -51,35 +46,50 @@ fn process_event<F: FnMut(InputEvent)>(device: &evdev_rs::Device, mut f: F) {
                 }
             }
             Ok((_read_status, event)) => {
-                debug!("event: {:?}", event);
+                match event.event_code {
+                    EventCode::EV_SYN(_) | EventCode::EV_MSC(_) => trace!("event: {:?}", event),
+                    _ => debug!("event: {:?}", event),
+                }
                 f(event);
             }
         }
     }
 }
 
-fn init_device(device_id: usize, epoll_fd: RawFd) -> (evdev_rs::Device, RawFd) {
+fn init_device(
+    device_id: usize,
+    epoll_fd: RawFd,
+) -> anyhow::Result<Option<(usize, evdev_rs::Device)>> {
     let path = format!("/dev/input/event{}", device_id);
-    let file = File::open(path.clone()).expect(&format!("failed to open {}", path));
+    let file = match File::open(path.clone()) {
+        Ok(file) => file,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            } else {
+                return Err(e).with_context(|| format!("failed to open {}", path));
+            }
+        }
+    };
     let fd = file.as_raw_fd();
 
     let _ = nix::fcntl::fcntl(
         fd,
         nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
     )
-    .expect("failed to put device into non-blocking mode");
+    .context("failed to put device into non-blocking mode")?;
     let () = epoll::ctl(
         epoll_fd,
         epoll::ControlOptions::EPOLL_CTL_ADD,
         fd,
-        epoll::Event::new(epoll::Events::EPOLLIN, fd as u64),
+        epoll::Event::new(epoll::Events::EPOLLIN, device_id as u64),
     )
-    .expect("failed to add fd to epoll");
+    .context("failed to add fd to epoll")?;
 
-    (
+    Ok(Some((
+        device_id,
         evdev_rs::Device::new_from_file(file).expect("failed to init keyboard device"),
-        fd,
-    )
+    )))
 }
 
 fn inject_event(l: &evdev_rs::UInputDevice, event: InputEvent) -> std::io::Result<()> {
@@ -127,25 +137,73 @@ fn inject_btn(
 }
 
 fn main() {
-    let Args {
-        keyboard_device_id,
-        mouse_device_id,
-        log_level,
-    } = argh::from_env();
+    let Args { log_level } = argh::from_env();
 
     let () = simplelog::SimpleLogger::init(log_level, simplelog::Config::default())
         .expect("failed to initialize logger");
 
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    info!("scanning for mouse and keyboard devices");
+    let epoll_fd = epoll::create(false).expect("failed to create epoll fd");
+    let devices = (0..100)
+        .into_iter()
+        .map(|id| init_device(id, epoll_fd).unwrap())
+        .filter_map(|opt| opt)
+        .collect::<HashMap<_, _>>();
+    let mut epoll_buf = epoll::Event::new(epoll::Events::empty(), 0);
+    let (keeb_id, mouse_id) = (|| {
+        let (mut keeb_id, mut mouse_id) = (None, None);
+        loop {
+            let _must_be_one: usize =
+                epoll::wait(epoll_fd, -1, std::slice::from_mut(&mut epoll_buf))
+                    .expect("failed to wait on epoll");
+            let id = epoll_buf.data as usize;
+            process_event(
+                &devices.get(&id).expect("unknown fd returned by epoll"),
+                |InputEvent {
+                     time: _,
+                     event_code,
+                     value,
+                 }| {
+                    match event_code {
+                        EventCode::EV_KEY(EV_KEY::BTN_LEFT)
+                        | EventCode::EV_KEY(EV_KEY::BTN_RIGHT)
+                        | EventCode::EV_KEY(EV_KEY::BTN_MIDDLE)
+                        | EventCode::EV_KEY(EV_KEY::BTN_EXTRA)
+                        | EventCode::EV_KEY(EV_KEY::BTN_SIDE)
+                        | EventCode::EV_REL(_) => {
+                            if mouse_id.is_none() {
+                                mouse_id = Some(id);
+                                info!("mouse id {}", id);
+                            }
+                        }
+                        EventCode::EV_KEY(_) => {
+                            if value == 0 && keeb_id.is_none() {
+                                keeb_id = Some(id);
+                                info!("keeb id {}", id);
+                            }
+                        }
+                        _ => {}
+                    }
+                },
+            );
+            if let (Some(keeb_id), Some(mouse_id)) = (keeb_id, mouse_id) {
+                return (keeb_id, mouse_id);
+            }
+        }
+    })();
 
     let epoll_fd = epoll::create(false).expect("failed to create epoll fd");
-
-    let (mut keeb_device, keeb_fd) = init_device(keyboard_device_id, epoll_fd);
-    let (mouse_device, mouse_fd) = init_device(mouse_device_id, epoll_fd);
+    let (_, mut keeb_device) = init_device(keeb_id, epoll_fd).unwrap().unwrap();
+    let (_, mouse_device) = init_device(mouse_id, epoll_fd).unwrap().unwrap();
 
     let uninit_device = evdev_rs::UninitDevice::new().expect("failed to create uninit device");
-    let () = uninit_device.enable(&EventType::EV_KEY).expect("failed to enable key events");
-    let () = uninit_device.enable(&EventType::EV_REL).expect("failed to enable rel events");
+    let () = uninit_device
+        .enable(&EventType::EV_KEY)
+        .expect("failed to enable key events");
+    let () = uninit_device
+        .enable(&EventType::EV_REL)
+        .expect("failed to enable rel events");
+    // TODO this should be a macro.
     for code in EventCode::EV_KEY(EV_KEY::KEY_RESERVED)
         .iter()
         .take_while(|e| {
@@ -173,25 +231,23 @@ fn main() {
     uninit_device.set_product_id(1);
     uninit_device.set_vendor_id(1);
     uninit_device.set_bustype(3);
+    let l = evdev_rs::UInputDevice::create_from_device(&uninit_device)
+        .expect("failed to create uinput device");
 
     let () = keeb_device
         .grab(evdev_rs::GrabMode::Grab)
         .expect("failed to grab keyboard device");
 
-    let l = evdev_rs::UInputDevice::create_from_device(&uninit_device)
-        .expect("failed to create uinput device");
-
     let mut state = State {
         current_key: None,
         next_key: EV_KEY::KEY_GRAVE,
         held: false,
-        middle: false,
     };
     let mut epoll_buf = epoll::Event::new(epoll::Events::empty(), 0);
     loop {
         let _must_be_one: usize = epoll::wait(epoll_fd, -1, std::slice::from_mut(&mut epoll_buf))
             .expect("failed to wait on epoll");
-        if epoll_buf.data as i32 == keeb_fd {
+        if epoll_buf.data as usize == keeb_id {
             process_event(&keeb_device, |event| {
                 let InputEvent {
                     time: _,
@@ -258,7 +314,7 @@ fn main() {
                 }
                 let () = l.write_event(&event).expect("failed to forward event");
             });
-        } else if epoll_buf.data as i32 == mouse_fd {
+        } else if epoll_buf.data as usize == mouse_id {
             process_event(&mouse_device, |event| {
                 let InputEvent {
                     time,
@@ -275,20 +331,6 @@ fn main() {
                     EventCode::EV_REL(EV_REL::REL_WHEEL) if value == -1 => {
                         inject_btn(&l, time, EV_KEY::KEY_PAGEDOWN)
                             .expect("failed to inject pagedown on scrolldown");
-                    }
-                    EventCode::EV_KEY(EV_KEY::BTN_MIDDLE) if value == 1 => {
-                        state.middle = true;
-                    }
-                    EventCode::EV_KEY(EV_KEY::BTN_MIDDLE) if value == 0 => {
-                        state.middle = false;
-                    }
-                    EventCode::EV_KEY(EV_KEY::BTN_LEFT) if value == 1 && state.middle => {
-                        inject_btn(&l, time, EV_KEY::KEY_HOME)
-                            .expect("failed to inject home on mmb+lmb");
-                    }
-                    EventCode::EV_KEY(EV_KEY::BTN_RIGHT) if value == 1 && state.middle => {
-                        inject_btn(&l, time, EV_KEY::KEY_END)
-                            .expect("failed to inject home on mmb+lmb");
                     }
                     _ => {}
                 }
