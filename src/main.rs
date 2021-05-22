@@ -92,48 +92,27 @@ fn init_device(
     )))
 }
 
-fn inject_event(l: &evdev_rs::UInputDevice, event: InputEvent) -> std::io::Result<()> {
+fn inject_event(l: &evdev_rs::UInputDevice, event_code: EventCode, value: i32) -> std::io::Result<()> {
+    let event = InputEvent {
+        event_code,
+        value,
+        time: evdev_rs::TimeVal {
+            tv_sec: 0, tv_usec: 0,
+        },
+    };
     info!("injecting event: {:?}", event);
     l.write_event(&event)
 }
 
 fn inject_btn(
     l: &evdev_rs::UInputDevice,
-    time: evdev_rs::TimeVal,
     btn: EV_KEY,
 ) -> std::io::Result<()> {
-    let () = inject_event(
-        &l,
-        InputEvent {
-            time,
-            event_code: EventCode::EV_KEY(btn),
-            value: 1,
-        },
-    )?;
-    let () = inject_event(
-        &l,
-        InputEvent {
-            time,
-            event_code: EventCode::EV_SYN(EV_SYN::SYN_REPORT),
-            value: 0,
-        },
-    )?;
-    let () = inject_event(
-        &l,
-        InputEvent {
-            time,
-            event_code: EventCode::EV_KEY(btn),
-            value: 0,
-        },
-    )?;
-    inject_event(
-        &l,
-        InputEvent {
-            time,
-            event_code: EventCode::EV_SYN(EV_SYN::SYN_REPORT),
-            value: 0,
-        },
-    )
+    let () = inject_event(&l, EventCode::EV_KEY(btn), 1)?;
+    let () = inject_event(&l, EventCode::EV_SYN(EV_SYN::SYN_REPORT), 0)?;
+    let () = inject_event(&l, EventCode::EV_KEY(btn), 0)?;
+    let () = inject_event(&l, EventCode::EV_SYN(EV_SYN::SYN_REPORT), 0)?;
+    Ok(())
 }
 
 fn main() {
@@ -197,36 +176,28 @@ fn main() {
     let (_, mouse_device) = init_device(mouse_id, epoll_fd).unwrap().unwrap();
 
     let uninit_device = evdev_rs::UninitDevice::new().expect("failed to create uninit device");
-    let () = uninit_device
-        .enable(&EventType::EV_KEY)
-        .expect("failed to enable key events");
-    let () = uninit_device
-        .enable(&EventType::EV_REL)
-        .expect("failed to enable rel events");
-    // TODO this should be a macro.
-    for code in EventCode::EV_KEY(EV_KEY::KEY_RESERVED)
-        .iter()
-        .take_while(|e| {
-            if let EventCode::EV_KEY(_) = e {
-                true
-            } else {
-                false
+    macro_rules! enable_codes {
+        ($etype:ident, $first:ident) => {
+            let () = uninit_device
+                .enable(&EventType::$etype)
+                .expect("failed to enable events");
+            for code in EventCode::$etype($etype::$first)
+                .iter()
+                .take_while(|e| {
+                    if let EventCode::$etype(_) = e {
+                        true
+                    } else {
+                        false
+                    }
+                })
+            {
+                debug!("adding code: {:?}", code);
+                let () = uninit_device.enable(&code).unwrap();
             }
-        })
-    {
-        debug!("adding code: {:?}", code);
-        let () = uninit_device.enable(&code).unwrap();
-    }
-    for code in EventCode::EV_REL(EV_REL::REL_X).iter().take_while(|e| {
-        if let EventCode::EV_REL(_) = e {
-            true
-        } else {
-            false
         }
-    }) {
-        debug!("adding code: {:?}", code);
-        let () = uninit_device.enable(&code).unwrap();
     }
+    enable_codes!(EV_KEY, KEY_RESERVED);
+    enable_codes!(EV_REL, REL_X);
     uninit_device.set_name("sc2input");
     uninit_device.set_product_id(1);
     uninit_device.set_vendor_id(1);
@@ -257,38 +228,19 @@ fn main() {
                 match event_code {
                     EventCode::EV_KEY(EV_KEY::KEY_GRAVE) if value == 0 => {
                         if let Some(current_key) = state.current_key.take() {
-                            inject_event(
-                                &l,
-                                InputEvent {
-                                    event_code: EventCode::EV_KEY(current_key),
-                                    ..event.clone()
-                                },
-                            )
-                            .expect("failed to rewrite grave release event");
+                            inject_event(&l, EventCode::EV_KEY(current_key), value)
+                                .expect("failed to rewrite grave release event");
                             return;
                         }
                     }
                     EventCode::EV_KEY(EV_KEY::KEY_GRAVE) => {
                         state.current_key = Some(state.next_key);
                         if value == 1 && state.held {
-                            inject_event(
-                                &l,
-                                InputEvent {
-                                    value: 0,
-                                    event_code: EventCode::EV_KEY(state.next_key),
-                                    ..event.clone()
-                                },
-                            )
-                            .expect("failed to inject artificial release before grave press event");
+                            inject_event(&l, EventCode::EV_KEY(state.next_key), 0)
+                                .expect("failed to inject artificial release before grave press event");
                         }
-                        inject_event(
-                            &l,
-                            InputEvent {
-                                event_code: EventCode::EV_KEY(state.next_key),
-                                ..event.clone()
-                            },
-                        )
-                        .expect("failed to rewrite grave press/repeat event");
+                        inject_event(&l, EventCode::EV_KEY(state.next_key), value)
+                            .expect("failed to rewrite grave press/repeat event");
                         return;
                     }
                     EventCode::EV_KEY(k) => {
@@ -301,11 +253,8 @@ fn main() {
                                 state.next_key = mapped;
                                 state.held = true;
                                 if state.current_key == Some(mapped) {
-                                    inject_event(&l, InputEvent {
-                                        value: 0,
-                                        ..event.clone()
-                                    })
-                                    .expect("failed to inject artificial release before key press event");
+                                    inject_event(&l, event_code, 0)
+                                        .expect("failed to inject artificial release before key press event");
                                 }
                             }
                         }
@@ -317,19 +266,19 @@ fn main() {
         } else if epoll_buf.data as usize == mouse_id {
             process_event(&mouse_device, |event| {
                 let InputEvent {
-                    time,
+                    time: _,
                     event_code,
                     value,
                 } = event;
                 match event_code {
                     // scroll up
                     EventCode::EV_REL(EV_REL::REL_WHEEL) if value == 1 => {
-                        inject_btn(&l, time, EV_KEY::KEY_PAGEUP)
+                        inject_btn(&l, EV_KEY::KEY_PAGEUP)
                             .expect("failed to inject pageup on scrollup");
                     }
                     // scroll down
                     EventCode::EV_REL(EV_REL::REL_WHEEL) if value == -1 => {
-                        inject_btn(&l, time, EV_KEY::KEY_PAGEDOWN)
+                        inject_btn(&l, EV_KEY::KEY_PAGEDOWN)
                             .expect("failed to inject pagedown on scrolldown");
                     }
                     _ => {}
