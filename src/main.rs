@@ -4,9 +4,10 @@ use async_io::Async;
 use evdev_rs::enums::{EventCode, EventType, EV_KEY, EV_REL, EV_SYN};
 use evdev_rs::{DeviceWrapper as _, InputEvent, UInputDevice};
 use futures::{ready, select, StreamExt as _, TryStreamExt as _};
-use log::{debug, info, trace};
+use log::{debug, info, trace, warn};
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -78,6 +79,13 @@ impl futures::Stream for AsyncDevice {
 }
 
 impl AsyncDevice {
+    fn new<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
+        File::open(path)
+            .and_then(|file| evdev_rs::Device::new_from_file(file))
+            .and_then(|device| Async::new(Device(device)))
+            .map(AsyncDevice)
+    }
+
     fn grab(&mut self, grab: evdev_rs::GrabMode) -> std::io::Result<()> {
         self.0.get_mut().0.grab(grab)
     }
@@ -98,26 +106,6 @@ struct State {
     current_key: Option<EV_KEY>,
     next_key: EV_KEY,
     held: bool,
-}
-
-fn init_device(device_id: usize) -> anyhow::Result<Option<AsyncDevice>> {
-    let path = format!("/dev/input/event{}", device_id);
-    let file = match File::open(path.clone()) {
-        Ok(file) => file,
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                return Ok(None);
-            } else {
-                return Err(e).with_context(|| format!("failed to open {}", path));
-            }
-        }
-    };
-    Ok(Some(AsyncDevice(
-        Async::new(Device(
-            evdev_rs::Device::new_from_file(file).context("failed to init device")?,
-        ))
-        .context("failed to create async device")?,
-    )))
 }
 
 fn inject_event(l: &UInputDevice, event_code: EventCode, value: i32) -> std::io::Result<()> {
@@ -160,29 +148,38 @@ fn main() {
         .expect("failed to initialize logger");
 
     info!("scanning for mouse and keyboard devices");
-    let (keeb_id, mouse_id) = async_io::block_on(async {
-        // TODO enumerate all devices using /dev/input/event* instead.
-        let mut devices = futures::stream::select_all(
-            (0..100)
+    let (keeb_path, mouse_path) = async_io::block_on(async {
+        let mut streams = futures::stream::select_all(
+            glob::glob("/dev/input/event*")
+                .expect("glob for /dev/input/event* failed")
                 .into_iter()
-                .map(|id| init_device(id).unwrap().map(|device| (id, device)))
-                .filter_map(|opt| opt)
-                .map(|(id, device)| device.map(move |r| r.map(|event| (id, event)))),
+                .filter_map(|r| match r {
+                    Ok(path) => Some(path),
+                    Err(e) => {
+                        warn!("glob iterator failed: {:?}", e);
+                        None
+                    }
+                })
+                .map(|path| {
+                    AsyncDevice::new(&path)
+                        .expect("failed to initialize async device")
+                        .map(move |event| event.map(|event| (path.clone(), event)))
+                }),
         );
-        let (mut keeb_id, mut mouse_id) = (None, None);
+        let (mut keeb_path, mut mouse_path) = (None, None);
         loop {
             let (
-                id,
+                path,
                 InputEvent {
                     time: _,
                     event_code,
                     value,
                 },
-            ) = devices
+            ) = streams
                 .try_next()
                 .await
-                .expect("failed to read event")
-                .expect("stream ended unexpectedly");
+                .expect("device stream empty")
+                .expect("failed to read event");
             match event_code {
                 EventCode::EV_KEY(EV_KEY::BTN_LEFT)
                 | EventCode::EV_KEY(EV_KEY::BTN_RIGHT)
@@ -190,31 +187,24 @@ fn main() {
                 | EventCode::EV_KEY(EV_KEY::BTN_EXTRA)
                 | EventCode::EV_KEY(EV_KEY::BTN_SIDE)
                 | EventCode::EV_REL(_) => {
-                    if mouse_id.is_none() {
-                        mouse_id = Some(id);
-                        info!("mouse id {}", id);
+                    if mouse_path.is_none() {
+                        info!("mouse device {:?}", path);
+                        mouse_path = Some(path);
                     }
                 }
                 EventCode::EV_KEY(_) => {
-                    if value == 0 && keeb_id.is_none() {
-                        keeb_id = Some(id);
-                        info!("keeb id {}", id);
+                    if value == 0 && keeb_path.is_none() {
+                        info!("keeb device {:?}", path);
+                        keeb_path = Some(path);
                     }
                 }
                 _ => {}
             }
-            if let (Some(keeb_id), Some(mouse_id)) = (keeb_id, mouse_id) {
-                return (keeb_id, mouse_id);
+            if let (Some(keeb_path), Some(mouse_path)) = (&keeb_path, &mouse_path) {
+                return (keeb_path.clone(), mouse_path.clone());
             }
         }
     });
-
-    let mut keeb_device = init_device(keeb_id).unwrap().unwrap();
-    let () = keeb_device
-        .grab(evdev_rs::GrabMode::Grab)
-        .expect("failed to grab keyboard device");
-
-    let mouse_device = init_device(mouse_id).unwrap().unwrap();
 
     let uninit_device = evdev_rs::UninitDevice::new().expect("failed to create uninit device");
     macro_rules! enable_codes {
@@ -242,6 +232,14 @@ fn main() {
     uninit_device.set_bustype(3);
     let l =
         UInputDevice::create_from_device(&uninit_device).expect("failed to create uinput device");
+
+    let (mut keeb_device, mouse_device) = (
+        AsyncDevice::new(keeb_path).expect("failed to create keyboard device"),
+        AsyncDevice::new(mouse_path).expect("failed to create mouse device"),
+    );
+    let () = keeb_device
+        .grab(evdev_rs::GrabMode::Grab)
+        .expect("failed to grab keyboard device");
 
     async_io::block_on(async {
         let mut mouse_device = mouse_device.fuse();
