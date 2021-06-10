@@ -1,15 +1,10 @@
-use anyhow::Context as _;
 use argh::FromArgs;
-use async_io::Async;
-use evdev_rs::enums::{EventCode, EventType, EV_KEY, EV_REL, EV_SYN};
+use evdev_rs::enums::{EventCode, EV_KEY, EV_REL, EV_SYN};
 use evdev_rs::{DeviceWrapper as _, InputEvent, UInputDevice};
-use futures::{ready, select, StreamExt as _, TryStreamExt as _};
-use log::{debug, info, trace, warn};
-use std::fs::File;
-use std::os::unix::io::{AsRawFd, RawFd};
-use std::path::Path;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use evdev_utils::{DeviceWrapperExt as _};
+use futures::{select, StreamExt as _, TryStreamExt as _};
+use log::{debug, info, trace};
+use evdev_utils::AsyncDevice;
 
 #[derive(FromArgs)]
 /// SC2 input remapping arguments.
@@ -30,75 +25,6 @@ fn keymap(key: &EV_KEY) -> Option<EV_KEY> {
         | EV_KEY::KEY_LEFTMETA
         | EV_KEY::KEY_RIGHTMETA => None,
         _ => Some(key.clone()),
-    }
-}
-
-struct Device(evdev_rs::Device);
-
-impl AsRawFd for Device {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0.file().as_raw_fd()
-    }
-}
-
-struct AsyncDevice(Async<Device>);
-
-impl futures::Stream for AsyncDevice {
-    type Item = Result<InputEvent, anyhow::Error>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // XXX This logic is hideous because libevdev's `next_event` function will read all
-        // available events from the fd and buffer them internally, so when the fd becomes readable
-        // it's necessary to continue from libevdev until the buffer is exhausted before the fd
-        // will signal readable again.
-        Poll::Ready(Some(if self.has_event_pending() {
-            self.next_event(evdev_rs::ReadFlag::NORMAL)
-                .map(|(_, event)| event)
-                .context("has event pending")
-        } else {
-            match ready!(self.0.poll_readable(cx)) {
-                Ok(()) => {
-                    match self
-                        .next_event(evdev_rs::ReadFlag::NORMAL)
-                        .map(|(_, event)| event)
-                    {
-                        Ok(event) => Ok(event),
-                        Err(e) => {
-                            if e.kind() == std::io::ErrorKind::WouldBlock {
-                                return self.poll_next(cx);
-                            } else {
-                                Err(e).context("next_event after poll")
-                            }
-                        }
-                    }
-                }
-                Err(e) => Err(e).context("poll error"),
-            }
-        }))
-    }
-}
-
-impl AsyncDevice {
-    fn new<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
-        File::open(path)
-            .and_then(|file| evdev_rs::Device::new_from_file(file))
-            .and_then(|device| Async::new(Device(device)))
-            .map(AsyncDevice)
-    }
-
-    fn grab(&mut self, grab: evdev_rs::GrabMode) -> std::io::Result<()> {
-        self.0.get_mut().0.grab(grab)
-    }
-
-    fn next_event(
-        &self,
-        flags: evdev_rs::ReadFlag,
-    ) -> std::io::Result<(evdev_rs::ReadStatus, InputEvent)> {
-        self.0.get_ref().0.next_event(flags)
-    }
-
-    fn has_event_pending(&self) -> bool {
-        self.0.get_ref().0.has_event_pending()
     }
 }
 
@@ -147,85 +73,13 @@ fn main() {
         .init()
         .expect("failed to initialize logger");
 
-    info!("scanning for mouse and keyboard devices");
-    let (keeb_path, mouse_path) = async_io::block_on(async {
-        let mut streams = futures::stream::select_all(
-            glob::glob("/dev/input/event*")
-                .expect("glob for /dev/input/event* failed")
-                .into_iter()
-                .filter_map(|r| match r {
-                    Ok(path) => Some(path),
-                    Err(e) => {
-                        warn!("glob iterator failed: {:?}", e);
-                        None
-                    }
-                })
-                .map(|path| {
-                    AsyncDevice::new(&path)
-                        .expect("failed to initialize async device")
-                        .map(move |event| event.map(|event| (path.clone(), event)))
-                }),
-        );
-        let (mut keeb_path, mut mouse_path) = (None, None);
-        loop {
-            let (
-                path,
-                InputEvent {
-                    time: _,
-                    event_code,
-                    value,
-                },
-            ) = streams
-                .try_next()
-                .await
-                .expect("device stream empty")
-                .expect("failed to read event");
-            match event_code {
-                EventCode::EV_KEY(EV_KEY::BTN_LEFT)
-                | EventCode::EV_KEY(EV_KEY::BTN_RIGHT)
-                | EventCode::EV_KEY(EV_KEY::BTN_MIDDLE)
-                | EventCode::EV_KEY(EV_KEY::BTN_EXTRA)
-                | EventCode::EV_KEY(EV_KEY::BTN_SIDE)
-                | EventCode::EV_REL(_) => {
-                    if mouse_path.is_none() {
-                        info!("mouse device {:?}", path);
-                        mouse_path = Some(path);
-                    }
-                }
-                EventCode::EV_KEY(_) => {
-                    if value == 0 && keeb_path.is_none() {
-                        info!("keeb device {:?}", path);
-                        keeb_path = Some(path);
-                    }
-                }
-                _ => {}
-            }
-            if let (Some(keeb_path), Some(mouse_path)) = (&keeb_path, &mouse_path) {
-                return (keeb_path.clone(), mouse_path.clone());
-            }
-        }
-    });
+    let (keeb_path, mouse_path) = futures::executor::block_on(evdev_utils::identify_mkb())
+        .expect("failed to identify keyboard and mouse");
+    info!("found mouse {:?} and keyboard {:?}", mouse_path, keeb_path);
 
     let uninit_device = evdev_rs::UninitDevice::new().expect("failed to create uninit device");
-    macro_rules! enable_codes {
-        ($etype:ident, $first:ident) => {
-            let () = uninit_device
-                .enable(&EventType::$etype)
-                .expect("failed to enable events");
-            for code in EventCode::$etype($etype::$first).iter().take_while(|e| {
-                if let EventCode::$etype(_) = e {
-                    true
-                } else {
-                    false
-                }
-            }) {
-                debug!("adding code: {:?}", code);
-                let () = uninit_device.enable(&code).unwrap();
-            }
-        };
-    }
-    enable_codes!(EV_KEY, KEY_RESERVED);
-    enable_codes!(EV_REL, REL_X);
+    let () = uninit_device.enable_keys().expect("failed to enable keyboard functionality");
+    let () = uninit_device.enable_mouse().expect("failed to enable mouse functionality");
     uninit_device.set_name("sc2input");
     uninit_device.set_product_id(1);
     uninit_device.set_vendor_id(1);
@@ -241,7 +95,7 @@ fn main() {
         .grab(evdev_rs::GrabMode::Grab)
         .expect("failed to grab keyboard device");
 
-    async_io::block_on(async {
+    futures::executor::block_on(async {
         let mut mouse_device = mouse_device.fuse();
         let mut keeb_device = keeb_device.fuse();
         let mut state = State {
