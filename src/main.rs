@@ -24,7 +24,10 @@ fn keymap(key: &EV_KEY) -> Option<EV_KEY> {
         | EV_KEY::KEY_RIGHTALT
         | EV_KEY::KEY_LEFTMETA
         | EV_KEY::KEY_RIGHTMETA => None,
-        _ => Some(key.clone()),
+        EV_KEY::KEY_3 => Some(EV_KEY::KEY_5),
+        EV_KEY::KEY_2 => Some(EV_KEY::KEY_6),
+        EV_KEY::KEY_1 => Some(EV_KEY::KEY_7),
+        _ => Some(*key),
     }
 }
 
