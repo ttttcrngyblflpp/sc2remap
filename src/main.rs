@@ -26,9 +26,9 @@ fn keymap(key: &EV_KEY) -> Option<EV_KEY> {
         | EV_KEY::KEY_RIGHTALT
         | EV_KEY::KEY_LEFTMETA
         | EV_KEY::KEY_RIGHTMETA => None,
-        EV_KEY::KEY_3 => Some(EV_KEY::KEY_5),
-        EV_KEY::KEY_2 => Some(EV_KEY::KEY_6),
-        EV_KEY::KEY_1 => Some(EV_KEY::KEY_7),
+        EV_KEY::KEY_1 => Some(EV_KEY::KEY_6),
+        EV_KEY::KEY_2 => Some(EV_KEY::KEY_7),
+        EV_KEY::KEY_3 => Some(EV_KEY::KEY_8),
         _ => Some(*key),
     }
 }
@@ -48,7 +48,7 @@ fn log_event(event: &InputEvent) {
     }
 }
 
-const REPEAT_KEY: EV_KEY = EV_KEY::KEY_5;
+const REPEAT_KEY: EV_KEY = EV_KEY::KEY_F24;
 
 fn main() {
     let Args { log_level } = argh::from_env();
