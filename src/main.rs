@@ -54,6 +54,7 @@ fn main() {
     let Args { log_level } = argh::from_env();
 
     simple_logger::SimpleLogger::new()
+        .with_utc_timestamps()
         .with_level(log::LevelFilter::Warn)
         .with_module_level(std::module_path!(), log_level)
         .init()
