@@ -343,6 +343,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "427c3892f9e783d91cc128285287e70a59e206ca452770ece88a76f7a3eddd72"
 
 [[package]]
+name = "pidlock"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9803429506fea3b35e5febd46e954169dd2704c19b81605a3e4c54b84ea8dbe6"
+dependencies = [
+ "libc",
+ "log",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -412,7 +422,9 @@ dependencies = [
  "evdev-utils",
  "futures",
  "glob",
+ "libc",
  "log",
+ "pidlock",
  "simple_logger",
 ]
 

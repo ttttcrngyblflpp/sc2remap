@@ -60,6 +60,11 @@ fn main() {
         .init()
         .expect("failed to initialize logger");
 
+    let mut pidlock = pidlock::Pidlock::new(&format!("/var/run/user/{}/sc2remap.pid", unsafe {
+        libc::geteuid()
+    }));
+    pidlock.acquire().unwrap();
+
     let (keeb_path, mouse_path) = futures::executor::block_on(evdev_utils::identify_mkb())
         .expect("failed to identify keyboard and mouse");
     info!("found mouse {:?} and keyboard {:?}", mouse_path, keeb_path);

@@ -12,5 +12,7 @@ edition = "2018"
 "evdev-utils" = { git = "https://github.com/ttttcrngyblflpp/evdev-utils", branch = "main" }
 "futures" = "0.3"
 "glob" = "0.3"
+"libc" = "0.2"
 "log" = "0.4"
+"pidlock" = "0.1"
 "simple_logger" = "1.16"
