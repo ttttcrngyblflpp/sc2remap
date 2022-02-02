@@ -137,7 +137,7 @@ dependencies = [
 [[package]]
 name = "evdev-utils"
 version = "0.1.0"
-source = "git+https://github.com/ttttcrngyblflpp/evdev-utils?branch=main#0fc6836607e21201830b1bf453943575d673b86f"
+source = "git+https://github.com/ttttcrngyblflpp/evdev-utils?branch=main#ebc2dcd3c204d7bc803fb806b1cd149ebb62e0b3"
 dependencies = [
  "async-io",
  "evdev-rs",
