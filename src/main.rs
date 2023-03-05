@@ -80,7 +80,7 @@ fn main() {
                 EventCode::EV_REL(EV_REL::REL_WHEEL) if value == 1 => {
                     if !drag_scroll_held {
                         debug!("injecting UP");
-                        l.inject_key_press(EV_KEY::KEY_UP)
+                        l.inject_key_press(EV_KEY::KEY_END)
                             .expect("failed to inject up on scrollup");
                     }
                 }
@@ -88,12 +88,13 @@ fn main() {
                 EventCode::EV_REL(EV_REL::REL_WHEEL) if value == -1 => {
                     if !drag_scroll_held {
                         debug!("injecting DOWN");
-                        l.inject_key_press(EV_KEY::KEY_DOWN)
+                        l.inject_key_press(EV_KEY::KEY_PAGEDOWN)
                             .expect("failed to inject down on scrolldown");
                     }
                 }
-                EventCode::EV_KEY(EV_KEY::BTN_SIDE) if value == 1 => {
-                    log::info!("status: {:?}", std::process::Command::new("/home/tone/.local/bin/side_btn.sh").status());
+                EventCode::EV_KEY(EV_KEY::BTN_EXTRA) => {
+                    l.inject_key_syn(EV_KEY::KEY_DELETE, value)
+                        .expect("failed to inject delete on forward side button");
                 }
                 _ => {}
             }
